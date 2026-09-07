@@ -1242,6 +1242,27 @@ func isEnableable(clientState *schemas.MCPClientState) bool {
 	return clientState.ExecutionConfig != nil && clientState.ExecutionConfig.Disabled
 }
 
+// awaitsAdminVerification reports whether config still needs the one-time
+// admin flow that AddClient parks clients in pending_verification for: an
+// OAuth client carrying an unauthorized inline oauth_config block, or a
+// per-user-headers / token-exchange client whose admin verification has never
+// populated DiscoveredTools. AddClient owns the canonical branches (each does
+// its own per-type bookkeeping and logging); this is the shared predicate for
+// callers that only need the yes/no.
+func awaitsAdminVerification(config *schemas.MCPClientConfig) bool {
+	if config == nil {
+		return false
+	}
+	switch config.AuthType {
+	case schemas.MCPAuthTypeOauth, schemas.MCPAuthTypePerUserOauth:
+		return config.PendingOAuthConfig != nil
+	case schemas.MCPAuthTypePerUserHeaders, schemas.MCPAuthTypeTokenExchange:
+		return config.DiscoveredTools == nil
+	default:
+		return false
+	}
+}
+
 // EnableClient re-enables a previously disabled MCP client by reconnecting it
 // and restarting its health monitor and tool syncer.
 //
@@ -1311,6 +1332,36 @@ func (m *MCPManager) EnableClient(id string) (retErr error) {
 	m.mu.Unlock()
 
 	m.logger.Debug("%s Enabling MCP client '%s'", MCPLogPrefix, configCopy.Name)
+
+	// A client that was disabled before its one-time admin flow ever ran is
+	// enabled but not yet usable. AddClient's disabled branch runs ahead of
+	// its pending_verification branches, so such a client is registered as
+	// Disabled with its PendingOAuthConfig (or empty DiscoveredTools) intact,
+	// and enabling it took the ordinary route from here: the per-call branch
+	// below marked it Healthy outright, and the sticky one dialled with a
+	// credential that does not exist yet and parked it back at Disabled.
+	// Either way the "an admin must authorize this" state was lost, and with
+	// it the Verify CTA that is the only way to resolve it. Park it where
+	// AddClient would have, and start no checker: there is nothing to check
+	// until the admin flow completes, exactly as on the AddClient path.
+	if awaitsAdminVerification(configCopy) {
+		m.mu.Lock()
+		if cs, exists := m.clientMap[id]; exists {
+			// Nil-checked for the same reason connectToMCPClient nil-checks it:
+			// nothing guarantees an entry reaching here was built by AddClient.
+			if cs.ConnectionInfo == nil {
+				cs.ConnectionInfo = &schemas.MCPClientConnectionInfo{Type: configCopy.ConnectionType}
+			}
+			if configCopy.ConnectionString != nil {
+				url := configCopy.ConnectionString.GetValue()
+				cs.ConnectionInfo.ConnectionURL = &url
+			}
+			cs.State = schemas.MCPConnectionStatePendingVerification
+		}
+		m.mu.Unlock()
+		m.logger.Debug("%s MCP client '%s' enabled into pending_verification (awaiting admin authorization)", MCPLogPrefix, configCopy.Name)
+		return nil
+	}
 
 	// Per-call clients have no persistent connection to dial. Mirror
 	// AddClient's per-call branch: restore the runtime state (tools, if any,
