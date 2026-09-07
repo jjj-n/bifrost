@@ -1,10 +1,12 @@
 package mcp
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/stretchr/testify/require"
 )
 
 // TestMCPErrorTypeClassification asserts that mcpErrorType maps failed MCP ops onto the
@@ -70,6 +72,69 @@ func TestMCPErrorTypeClassification(t *testing.T) {
 			if got := mcpErrorType(tt.err); got != tt.want {
 				t.Errorf("mcpErrorType() = %q, want %q", got, tt.want)
 			}
+		})
+	}
+}
+
+// TestProbeRetryConfig_RetriesTimeoutsButNotPermanentFailures pins the
+// classification the periodic connection checker's own ping / list_tools calls
+// run under. isTransientError's blanket "if something times out, retrying
+// won't help" is written for a dial, where a timeout usually means the
+// endpoint is wrong or unreachable. A heartbeat over an already-established
+// connection is the opposite case: ConnectionCheckTimeout is 5 seconds, so one
+// slow response from a busy upstream would otherwise exhaust none of the
+// probe's retry budget and mark the client Unstable on the first attempt.
+//
+// Everything the shared classifier calls permanent for a good reason (a 422
+// dead session, a 401, a 404) must still fail fast: retrying those over the
+// same connection cannot succeed, and the reconnect is what repairs them.
+func TestProbeRetryConfig_RetriesTimeoutsButNotPermanentFailures(t *testing.T) {
+	tests := []struct {
+		name         string
+		err          error
+		wantAttempts int
+	}{
+		{
+			name:         "probe timeout is retried",
+			err:          fmt.Errorf("ping failed: context deadline exceeded"),
+			wantAttempts: ProbeRetryConfig.MaxRetries + 1,
+		},
+		{
+			name:         "bare timeout wording is retried",
+			err:          fmt.Errorf("list_tools failed: i/o timeout"),
+			wantAttempts: ProbeRetryConfig.MaxRetries + 1,
+		},
+		{
+			name:         "dead session is permanent",
+			err:          fmt.Errorf("request failed with status 422: Unexpected message, expect initialize request"),
+			wantAttempts: 1,
+		},
+		{
+			name:         "terminated session is permanent",
+			err:          fmt.Errorf("session terminated (404). need to re-initialize"),
+			wantAttempts: 1,
+		},
+		{
+			name:         "auth rejection is permanent",
+			err:          fmt.Errorf("ping failed: 401 unauthorized"),
+			wantAttempts: 1,
+		},
+		{
+			name:         "auth rejection wins over timeout wording",
+			err:          fmt.Errorf("ping failed: 403 forbidden: timeout"),
+			wantAttempts: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			attempts := 0
+			err := ExecuteWithRetry(context.Background(), func() error {
+				attempts++
+				return tc.err
+			}, ProbeRetryConfig, &MockLogger{})
+			require.Error(t, err)
+			require.Equal(t, tc.wantAttempts, attempts)
 		})
 	}
 }

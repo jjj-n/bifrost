@@ -91,6 +91,7 @@ var ProbeRetryConfig = RetryConfig{
 	MaxRetries:     3,
 	InitialBackoff: 500 * time.Millisecond,
 	MaxBackoff:     4 * time.Second,
+	IsRetryable:    isTransientProbeError,
 }
 
 // ToolCallRetryConfig backs the live tool-call invocation itself
@@ -421,6 +422,46 @@ func isDeadSessionErrorText(errStr string) bool {
 		}
 	}
 	return false
+}
+
+// isTransientProbeError is ProbeRetryConfig's classifier, for the periodic
+// connection checker's own ping / list_tools calls. It differs from the shared
+// isTransientError in two ways, both because a probe runs over an
+// already-established connection instead of establishing one:
+//
+//   - A timeout is retryable here. isTransientError's blanket "if something
+//     times out, retrying won't help" fits a dial, where a timeout usually
+//     means the endpoint is wrong or unreachable. ConnectionCheckTimeout is 5
+//     seconds, so without this one slow response from a busy upstream spends
+//     none of the retry budget the probe exists to absorb blips with, marking
+//     the client Unstable on the first attempt and, now that a failed check
+//     reconnects, churning a working session over a single hiccup. The worst
+//     case this admits (four 5-second attempts plus the config's ~3.5s of
+//     backoff per operation) is what any unrecognized connection error already
+//     costs on this path.
+//   - A dead session is permanent, via the same classifier the reactive
+//     tool-call path uses. mcp-go clears its session id and returns
+//     ErrSessionTerminated on a 404 without re-initializing, so every retry
+//     over this connection fails identically; only a reconnect repairs it, and
+//     retrying first just delays that by the whole backoff schedule.
+//
+// Auth rejections are checked before the timeout rule for the same reason
+// isTransientToolCallError checks them first: error text like "403 forbidden:
+// timeout" must not fall into the timeout branch.
+func isTransientProbeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	if isAuthFailureErrorText(errStr) || isDeadSessionErrorText(errStr) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) ||
+		strings.Contains(errStr, "deadline exceeded") ||
+		strings.Contains(errStr, "timeout") {
+		return true
+	}
+	return isTransientError(err)
 }
 
 // ExecuteWithRetry executes a function with exponential backoff retry logic.
