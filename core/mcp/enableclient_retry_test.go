@@ -122,15 +122,18 @@ func TestEnableClient_NilExecutionConfig_ReturnsErrorNotPanic(t *testing.T) {
 	assert.Nil(t, state.ExecutionConfig)
 }
 
-// TestEnableClient_ConnectFailure_ParksDisabledAndKeepsRetrying is the
+// TestEnableClient_ConnectFailure_ParksDisabledAndStaysEnableable is the
 // end-to-end companion to TestIsEnableable: it drives the real enable path
 // with a dial that fails and pins every claim the failure branch's comment
 // makes — the ErrMCPEnableConnectFailed sentinel callers match on to keep
-// their persisted disabled=false, the un-disabled ExecutionConfig, the state
-// parked back at Disabled (not Unstable, which would wedge every retry), and
-// the connection checker left running so the client can still come up on its
-// own.
-func TestEnableClient_ConnectFailure_ParksDisabledAndKeepsRetrying(t *testing.T) {
+// their persisted disabled=false, the un-disabled ExecutionConfig, and the
+// state parked back at Disabled (not Unstable, which would wedge every retry).
+//
+// Note what is NOT claimed: a checker is registered, but performCheck stops it
+// on its first tick rather than dialling a Disabled client, so nothing retries
+// this dial automatically. Recovery is the admin enabling again, which the
+// Disabled parking state exists to keep possible.
+func TestEnableClient_ConnectFailure_ParksDisabledAndStaysEnableable(t *testing.T) {
 	m := NewMCPManager(context.Background(), schemas.MCPConfig{}, genericFailureCredStore{}, nil, nil)
 	defer m.checkerManager.StopAll()
 
@@ -162,7 +165,7 @@ func TestEnableClient_ConnectFailure_ParksDisabledAndKeepsRetrying(t *testing.T)
 	m.checkerManager.mu.RLock()
 	_, checking := m.checkerManager.checkers[config.ID]
 	m.checkerManager.mu.RUnlock()
-	assert.True(t, checking, "a connection checker must be left retrying the dial in the background")
+	assert.True(t, checking, "a checker is registered, though for a Disabled client it stops itself rather than dialling")
 }
 
 // TestEnableClient_ConnectFailure_PreservesNeedsReauth covers the one state
